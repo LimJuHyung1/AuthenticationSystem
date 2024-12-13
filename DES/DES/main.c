@@ -6,6 +6,7 @@
 
 // 64비트 입력 배열: "123456ABCD132536"
 uint8_t input[8] = { 0x12, 0x34, 0x56, 0xAB, 0xCD, 0x13, 0x25, 0x36 };
+uint8_t initialKey[8] = { 0xAA, 0xBB, 0x09, 0x18, 0x27, 0x36, 0xCC, 0xDD };
 // uint8_t input[8] = { 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
 uint8_t output[ARRAY_SIZE] = { 0 }; // 출력 배열
 
@@ -146,31 +147,83 @@ int compressionTable[48] = {
 };
 
 void main() {
+    // Step 1: PlainText 출력
+    printf("PlainText:\n");
+    for (int i = 0; i < ARRAY_SIZE; i++) {
+        printf("0x%02X ", input[i]);
+    }
+    printf("\n\n");
+
+    // Step 2: 초기 치환
     Permute(input, output, initialPermutationTable, BIT_SIZE);
 
-    /*
-    // 결과 출력
-    printf("Permuted Array:\n");
+    // Step 3: 16개의 라운드 키 생성
+    uint64_t key = 0;
+    printf("Initial Key Bytes (8 bytes): ");
+    for (int i = 0; i < 8; i++) {
+        printf("0x%02X ", initialKey[i]); // 각 바이트 값 출력
+        key = (key << 8) | initialKey[i]; // 64비트 키 생성
+    }
+    printf("\nGenerated 64-bit Key: 0x%016lX\n", key);
+    GenerateKeys(key, roundKeys);
+
+    // Step 5: 32비트씩 나누기
+    uint32_t leftPart = (output[0] << 24) | (output[1] << 16) | (output[2] << 8) | output[3];
+    uint32_t rightPart = (output[4] << 24) | (output[5] << 16) | (output[6] << 8) | output[7];
+
+    printf("Initial Left:  0x%08X\n", leftPart);
+    printf("Initial Right: 0x%08X\n\n", rightPart);
+
+    // Step 6: 16번의 암호화 라운드
+    for (int round = 0; round < 16; round++) {
+        // 1. 확장 P 박스
+        uint64_t expandedRight = ExpandPBox(rightPart);
+
+        // 2. XOR with Round Key
+        uint64_t xored = expandedRight ^ roundKeys[round];
+
+        // 3. S 박스 적용
+        uint32_t substituted = 0;
+        for (int i = 0; i < 8; i++) {
+            int row = ((xored >> (47 - 6 * i)) & 0x20) >> 4 | ((xored >> (47 - 6 * i)) & 0x01);
+            int col = (xored >> (47 - 6 * i + 1)) & 0x0F;
+            substituted = (substituted << 4) | S_BOX[i][row][col];
+        }
+
+        // 4. P 박스 적용
+        uint32_t permuted = 0;
+        for (int i = 0; i < 32; i++) {
+            permuted |= ((substituted >> (31 - i)) & 1) << (31 - i);
+        }
+
+        // 5. XOR with Left
+        uint32_t temp = leftPart;
+        leftPart = rightPart;
+        rightPart = temp ^ permuted;
+
+        // 디버깅 출력
+        printf("Round %2d - Left: 0x%08X, Right: 0x%08X, Round Key: 0x%012lX\n",
+            round + 1, leftPart, rightPart, roundKeys[round]);
+    }
+
+    // Step 7: 마지막 라운드에서 좌우를 교환
+    uint32_t temp = leftPart;
+    leftPart = rightPart;
+    rightPart = temp;
+
+    // Step 8: 최종 치환
+    uint8_t preOutput[ARRAY_SIZE] = {
+        (leftPart >> 24) & 0xFF, (leftPart >> 16) & 0xFF, (leftPart >> 8) & 0xFF, leftPart & 0xFF,
+        (rightPart >> 24) & 0xFF, (rightPart >> 16) & 0xFF, (rightPart >> 8) & 0xFF, rightPart & 0xFF
+    };
+    Permute(preOutput, output, finalPermutationTable, BIT_SIZE);
+
+    // Step 9: CipherText 출력
+    printf("\nCipherText:\n");
     for (int i = 0; i < ARRAY_SIZE; i++) {
         printf("0x%02X ", output[i]);
     }
     printf("\n");
-    */
-    // 32비트씩 나누기
-    uint32_t leftPart = (output[0] << 24) | (output[1] << 16) | (output[2] << 8) | output[3];
-    uint32_t rightPart = (output[4] << 24) | (output[5] << 16) | (output[6] << 8) | output[7];
-
-    // 확장 P 박스 적용
-    uint64_t expandedLeft = ExpandPBox(leftPart);
-    uint64_t expandedRight = ExpandPBox(rightPart);
-
-    // 결과 출력
-    printf("Original Left Part (32-bit):  0x%08X\n", leftPart);
-    printf("Expanded Left Part (48-bit):  0x%012lX\n", expandedLeft);
-    printf("Original Right Part (32-bit): 0x%08X\n", rightPart);
-    printf("Expanded Right Part (48-bit): 0x%012lX\n", expandedRight);
-
-    return 0;
 }
 
 // 특정 비트를 추출하는 함수 (0 또는 1 반환)
@@ -280,35 +333,95 @@ uint32_t LeftCircularShift(uint32_t block, int shifts) {
     return ((block << shifts) | (block >> (28 - shifts))) & 0xFFFFFFF;
 }
 
-// DES 키 생성 함수
-void GenerateKeys(uint64_t input, uint64_t roundKeys[16]) {
-    uint64_t permutedKey = 0;
-    uint32_t C = 0, D = 0;
-
-    // Step 1: PC-1 적용
-    for (int i = 0; i < 56; i++) {
-        int bit = GenKeyGetBit(input, removeParityBitTable[i]);
-        GenKeySetBit(&permutedKey, i + 1, bit);
+// Function to remove parity bits using the table
+void removeParityBits(uint64_t initialKey, uint8_t compressedKey[7]) {
+    for (int i = 0; i < 7; i++) {
+        compressedKey[i] = 0;
     }
 
+    for (int i = 0; i < 56; i++) {
+        int bitPosition = removeParityBitTable[i] - 1; // 1-based index
+        int compressedByteIndex = i / 8;
+        int compressedBitIndex = 7 - (i % 8);
+
+        if (initialKey & (1ULL << (63 - bitPosition))) { // Access bit in uint64_t
+            compressedKey[compressedByteIndex] |= (1 << compressedBitIndex);
+        }
+    }
+}
+
+// Function to split the compressed key into two 28-bit halves
+void splitKeyIntoHalves(uint8_t compressedKey[7], uint32_t* left, uint32_t* right) {
+    *left = 0;
+    *right = 0;
+
+    // Extract the first 28 bits for the left half
+    for (int i = 0; i < 4; i++) {
+        *left |= (uint32_t)(compressedKey[i] << (24 - i * 8));
+    }
+    *left |= (compressedKey[3] & 0xF0) >> 4;
+
+    // Extract the next 28 bits for the right half
+    for (int i = 3; i < 6; i++) {
+        *right |= (uint32_t)((compressedKey[i] & 0x0F) << (28 - (i - 3) * 8));
+        *right |= (uint32_t)(compressedKey[i + 1] << (24 - (i - 3) * 8));
+    }
+    *right |= (compressedKey[6] & 0x0F);
+}
+
+// Function to perform left circular shift
+uint32_t leftCircularShift(uint32_t value, int shifts) {
+    return ((value << shifts) | (value >> (28 - shifts))) & 0x0FFFFFFF;
+}
+
+// Function to apply compression table and reduce 56-bit to 48-bit
+uint64_t applyCompressionTable(uint64_t combinedKey) {
+    uint64_t compressedKey = 0;
+    for (int i = 0; i < 48; i++) {
+        int bitPosition = compressionTable[i] - 1;
+        if (combinedKey & (1ULL << (55 - bitPosition))) {
+            compressedKey |= (1ULL << (47 - i));
+        }
+    }
+    return compressedKey;
+}
+
+void uint64ToUint8Array(uint64_t key, uint8_t keyArray[8]) {
+    for (int i = 0; i < 8; i++) {
+        keyArray[7 - i] = (key >> (i * 8)) & 0xFF; // MSB부터 저장
+    }
+}
+
+// DES 키 생성 함수
+void GenerateKeys(uint64_t input, uint64_t roundKeys[16]) {
+    uint8_t compressedKey[7];
+    uint32_t leftHalf, rightHalf;   
+
+    // Step 1: PC-1 적용 (패리티 비트 제거)
+    removeParityBits(input, compressedKey);
+
+    // PC-1 결과 출력
+    printf("Permuted Key after PC-1 (56-bit): 0x%014lX\n", compressedKey);
+
     // Step 2: C와 D로 분할
-    C = (permutedKey >> 28) & 0xFFFFFFF;
-    D = permutedKey & 0xFFFFFFF;
+    printf("Compressed Key (Parity Removed):\n");
+    for (int i = 0; i < 7; i++) {
+        printf("0x%02X ", compressedKey[i]);
+    }
+    printf("\n");
+
+    splitKeyIntoHalves(compressedKey, &leftHalf, &rightHalf);
+
 
     // Step 3: 16 라운드 키 생성
-    for (int round = 0; round < 16; round++) {
-        // 좌측 순환 이동
-        C = LeftCircularShift(C, shiftLeftTable[round]);
-        D = LeftCircularShift(D, shiftLeftTable[round]);
+    for (int i = 0; i < 16; i++) {
+        leftHalf = leftCircularShift(leftHalf, shiftLeftTable[i]);
+        rightHalf = leftCircularShift(rightHalf, shiftLeftTable[i]);
 
-        // 합치기
-        uint64_t combinedKey = ((uint64_t)C << 28) | D;
+        // Combine left and right halves into a 56-bit key
+        uint64_t combinedKey = ((uint64_t)leftHalf << 28) | (uint64_t)rightHalf;
 
-        // PC-2 적용
-        roundKeys[round] = 0;
-        for (int i = 0; i < 48; i++) {
-            int bit = GenKeyGetBit(combinedKey, compressionTable[i]);
-            GenKeySetBit(&roundKeys[round], i + 1, bit);
-        }
+        // Apply PC-2 table to map 56-bit key to 48-bit
+        roundKeys[i] = applyCompressionTable(combinedKey);
     }
 }
